@@ -11,10 +11,13 @@ from diffusers import (
     EulerDiscreteScheduler,
     EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
+    StableDiffusionImg2ImgPipeline,
+    StableDiffusionInpaintPipeline,
 )
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
+from PIL import Image
 
 
 MODEL_ID = "stabilityai/stable-diffusion-2-1"
@@ -31,11 +34,29 @@ class Predictor(BasePredictor):
             cache_dir=MODEL_CACHE,
             local_files_only=True,
         )
-        self.pipe = StableDiffusionPipeline.from_pretrained(
+        self.txt2img_pipe = StableDiffusionPipeline.from_pretrained(
             MODEL_ID,
             safety_checker=safety_checker,
             cache_dir=MODEL_CACHE,
             local_files_only=True,
+        ).to("cuda")
+        self.img2img_pipe = StableDiffusionImg2ImgPipeline(
+            vae=self.txt2img_pipe.vae,
+            text_encoder=self.txt2img_pipe.text_encoder,
+            tokenizer=self.txt2img_pipe.tokenizer,
+            unet=self.txt2img_pipe.unet,
+            scheduler=self.txt2img_pipe.scheduler,
+            safety_checker=self.txt2img_pipe.safety_checker,
+            feature_extractor=self.txt2img_pipe.feature_extractor,
+        ).to("cuda")
+        self.inpaint_pipe = StableDiffusionInpaintPipeline(
+            vae=self.txt2img_pipe.vae,
+            text_encoder=self.txt2img_pipe.text_encoder,
+            tokenizer=self.txt2img_pipe.tokenizer,
+            unet=self.txt2img_pipe.unet,
+            scheduler=self.txt2img_pipe.scheduler,
+            safety_checker=self.txt2img_pipe.safety_checker,
+            feature_extractor=self.txt2img_pipe.feature_extractor,
         ).to("cuda")
 
     @torch.inference_mode()
@@ -48,6 +69,12 @@ class Predictor(BasePredictor):
         negative_prompt: str = Input(
             description="Specify things to not see in the output",
             default=None,
+        ),
+        image: Path = Input(
+            description="Inital image to generate variations of.",
+        ),
+        mask: Path = Input(
+            description="Black and white image to use as mask for inpainting over the image provided. White pixels are inpainted and black pixels are preserved",
         ),
         width: int = Input(
             description="Width of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
@@ -101,10 +128,30 @@ class Predictor(BasePredictor):
                 "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
             )
 
-        self.pipe.scheduler = make_scheduler(scheduler, self.pipe.scheduler.config)
+        if image is not None:
+            image = Image.open(image).convert("RGB")
+
+        extra_kwargs = {}
+        if mask is not None:
+            assert image is not None
+            pipe = self.inpaint_pipe
+            extra_kwargs = {
+                "mask_image": Image.open(mask).convert("RGB").resize(image.size),
+                "image": image,
+            }
+        elif image is not None:
+            pipe = self.img2img_pipe
+            extra_kwargs = {
+                "image": image,
+                "strength": prompt_strength,
+            }
+        else:
+            pipe = self.txt2img_pipe
+
+        pipe.scheduler = make_scheduler(scheduler, self.pipe.scheduler.config)
 
         generator = torch.Generator("cuda").manual_seed(seed)
-        output = self.pipe(
+        output = pipe(
             prompt=[prompt] * num_outputs if prompt is not None else None,
             negative_prompt=[negative_prompt] * num_outputs
             if negative_prompt is not None
@@ -114,6 +161,7 @@ class Predictor(BasePredictor):
             guidance_scale=guidance_scale,
             generator=generator,
             num_inference_steps=num_inference_steps,
+            **extra_kwargs,
         )
 
         output_paths = []
